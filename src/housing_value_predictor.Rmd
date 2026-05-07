@@ -1,0 +1,756 @@
+---
+title: "Boston Housing Predictor"
+author: "Muki Mdluli"
+date: "2026-04-29"
+output:
+  pdf_document:
+    extra_dependencies: ["colortbl", "xcolor", "booktabs", "float", "placeins"]
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "left-align",
+  fig.pos = "htbp",
+  out.extra = ""
+)
+```
+
+# Boston Suburbs Housing Price Predictor
+
+This report investigates the key drivers of median home values across Boston 
+suburbs using multiple linear regression. The dataset contains 400 suburbs and 
+12 predictor variables, ranging from socioeconomic indicators such as the 
+proportion of lower-status residents (`lstat`) and crime rate (`crim`), to 
+structural characteristics such as average room count (`rm`) and proximity to 
+employment centres (`dis`). The analysis follows a structured modelling 
+pipeline: exploratory data analysis, full linear regression, backward stepwise 
+selection using AIC and BIC criteria, and Ridge and LASSO regularisation. 
+Model performance is assessed using 10-fold cross-validation RMSE and 
+test-set evaluation on a held-out sample. The goal is to identify the most 
+parsimonious and generalisable model that accurately predicts `medv` — the 
+median value of owner-occupied homes in \$1,000s.
+
+## Exploration
+
+The first step is to understand the size, structure, missingness, 
+distributions, and relationships in the training data. The response variable 
+is `medv`, the median value of owner-occupied homes in \$1000s.
+
+A brief description of the predictors is given in Table \ref{tab:vars}.
+
+```{r predictors_defined}
+library(kableExtra)
+
+boston_predictors <- data.frame(
+  Variable = c("crim", "zn", "indus", "chas", "nox", "rm", "age",
+               "dis", "rad", "tax", "ptratio", "lstat", "medv"),
+  Description = c(
+    "Per capita crime rate by town.",
+    "Proportion of residential land zoned for lots over 25,000 sq.ft.",
+    "Proportion of non-retail business acres per town.",
+    "Charles River dummy variable (= 1 if tract bounds river; 0 otherwise).",
+    "Nitrogen oxides concentration (parts per 10 million).",
+    "Average number of rooms per dwelling.",
+    "Proportion of owner-occupied units built prior to 1940.",
+    "Weighted mean of distances to five Boston employment centres.",
+    "Index of accessibility to radial highways.",
+    "Full-value property-tax rate per $10,000.",
+    "Pupil-teacher ratio by town.",
+    "Lower status of the population (percent).",
+    "Median value of owner-occupied homes in $1000s."
+  )
+)
+
+boston_predictors |>
+  kable(
+    caption   = "\\label{tab:vars}Descriptions of predictors in the Boston housing dataset.",
+    booktabs  = TRUE
+  ) |>
+  kable_styling(
+    full_width    = FALSE,
+    latex_options = c("striped")
+  ) |>
+  column_spec(2, width = "10cm")
+```
+
+A peek into the dataset shows that this training sample has 400 Boston suburbs 
+and 13 variables, of which `chas` is a categorical variable representing 
+suburbs near the Charles River.
+
+```{r exploration}
+boston_data <- read.csv('my_boston.csv', header = TRUE)
+
+boston_data$chas <- factor(
+  boston_data$chas,
+  levels = c(0, 1),
+  labels = c("No", "Yes")
+)
+
+proportion_yes <- prop.table(table(boston_data$chas))["Yes"]
+complement     <- 1 - proportion_yes
+percentage     <- round(complement * 100, 1)
+```
+
+The data types of the predictors are shown in Table \ref{tab:types}.
+
+```{r datatype_table}
+data_types <- data.frame(
+  Variable = names(boston_data),
+  Type     = sapply(boston_data, class),
+  row.names = NULL
+)
+
+data_types |>
+  kable(
+    caption  = "\\ref{tab:types}Variable types in the Boston housing training data.",
+    booktabs = TRUE
+  ) |>
+  kable_styling(
+    full_width    = FALSE,
+    latex_options = c("striped")
+  )
+```
+
+The first 10 rows of the dataset are shown in Table \ref{tab:head}.
+
+```{r head_table}
+head(boston_data, 10) |>
+  kable(
+    digits   = 2,
+    caption  = "\\label{tab:head}First 10 rows of the Boston housing training data.",
+    booktabs = TRUE
+  ) |>
+  kable_styling(
+    full_width    = FALSE,
+    latex_options = c("striped", "scale_down")
+  )
+```
+
+## Visualisations
+```{r distributions, fig.cap="\\label{fig:distributions}Histograms with density curves for all variables", fig.width=6, fig.height=4}
+numeric_boston      <- boston_data
+numeric_boston$chas <- as.numeric(numeric_boston$chas == "Yes")
+
+par(mfrow = c(3, 3), mar = c(4, 4, 2, 1))
+for (v in names(numeric_boston)) {
+  hist(numeric_boston[[v]],
+       main        = v,
+       xlab        = v,
+       col         = "gray85",
+       border      = "white",
+       probability = TRUE)
+  lines(density(numeric_boston[[v]]),
+        col = "blue",
+        lwd = 2)
+}
+```
+\FloatBarrier
+Findings of interest:
+
+- The dataset has no missing values.
+- The `chas` variable is very imbalanced: `r percentage`% of suburbs do not 
+  bound the Charles River, so predictions involving `chas` are based on 
+  relatively few observations.
+- Several variables are heavily right-skewed, especially `crim`, `zn`, `rad`, 
+  `tax`, `ptratio`, and `lstat`,  as seen in Figure \ref{fig:distributions} suggesting these characteristics are 
+  concentrated in certain suburbs rather than evenly distributed across Boston.
+
+### Explanatory-target relationships
+```{r medv-relationships, fig.cap="Scatterplots of each explanatory variable against median home value (medv)", fig.width=7, fig.height=6}
+scatter_predictors <- c("crim", "zn", "indus", "nox", "rm",
+                        "age", "dis", "rad", "tax", "ptratio", "lstat")
+
+par(mfrow = c(3, 4), mar = c(4, 4, 2, 1))
+for (v in scatter_predictors) {
+  plot(boston_data[[v]], boston_data$medv,
+       main = paste("medv vs", v),
+       xlab = v,
+       ylab = "medv",
+       col  = "gray5",
+       pch  = 16,
+       cex  = 0.55)
+  abline(lm(boston_data$medv ~ boston_data[[v]]),
+         col = "pink",
+         lwd = 2)
+}
+```
+
+```{r modelling-chas, fig.cap="Boxplots of median home value (medv) by Charles River adjacency (chas)", fig.width=4, fig.height=4}
+par(mfrow = c(1, 1))
+boxplot(medv ~ chas,
+        data = boston_data,
+        main = "MEDV by CHAS",
+        xlab = "Bounds Charles River",
+        ylab = "Median Home Value ($1000s)",
+        col  = "lightblue")
+```
+\FloatBarrier
+The clearest single-variable relationships with `medv` are with `lstat` 
+(negative), `rm` (positive), and `ptratio` (negative). Median home value 
+tends to rise with more rooms and fall as socioeconomic disadvantage and 
+pupil-teacher ratios increase.
+
+### Checking for Outliers
+
+```{r outliers, fig.cap="\\label{fig:outliers}Boxplots for each numeric predictor", fig.width=6, fig.height=6}
+library(ggplot2)
+library(gridExtra)
+
+numeric_boston_no_chas <- numeric_boston[, !names(numeric_boston) %in% "chas"]
+
+boxplots <- lapply(names(numeric_boston_no_chas), function(v) {
+  ggplot(numeric_boston_no_chas, aes(y = .data[[v]])) +
+    geom_boxplot(fill            = "lightblue",
+                 colour          = "black",
+                 outlier.colour  = "orange",
+                 outlier.size    = 2) +
+    labs(title = v, y = v, x = "") +
+    theme_minimal()
+})
+
+grid.arrange(grobs = boxplots, ncol = 4)
+```
+\FloatBarrier
+The orange points in Figure \ref{fig:outliers} represent outliers, present in `crim`, `zn`, `nox`, `rm`, 
+`dis`, `lstat`, and `medv`.
+
+### Multi-variable Correlation
+\FloatBarrier
+```{r pairs-plot, fig.cap="\\label{fig:pairs}Pairwise scatterplot matrix of the numeric predictors.", fig.width=5, fig.height=5, echo=FALSE}
+par(mfrow = c(1, 1))
+pairs(
+  numeric_boston[, c("crim","zn","indus","chas","nox","rm",
+                     "age","dis","rad","tax","ptratio","lstat")],
+  col         = "red",
+  pch         = 16,
+  cex         = 0.45,
+  main        = "Pairs Plot: Key Predictors",
+  upper.panel = NULL
+)
+```
+\FloatBarrier
+The pairwise matrix, (Figure \ref{fig:pairs}) reveals predictors that are strongly related to one 
+another. Notable relationships include `age` and `dis`, as well as `rm` and 
+`lstat`, suggesting these pairs may act as proxies for each other.
+
+```{r correlations, fig.cap="\\label{fig:corrmatrix}Correlation heatmap", fig.height=6, fig.width=7}
+cor_matrix <- cor(numeric_boston)
+
+ord    <- hclust(as.dist(1 - abs(cor_matrix)))$order
+cm_ord <- cor_matrix[ord, ord]
+n      <- ncol(cm_ord)
+pal    <- colorRampPalette(c("navy", "white", "maroon"))(200)
+
+par(mar = c(7, 7, 3, 5))
+image(1:n, 1:n, cm_ord[n:1, ],
+      axes = FALSE, col = pal, zlim = c(-1, 1),
+      xlab = "", ylab = "", main = "Correlation Heatmap")
+axis(1, at = 1:n, labels = colnames(cm_ord), las = 2, cex.axis = 0.8)
+axis(2, at = 1:n, labels = rev(rownames(cm_ord)), las = 2, cex.axis = 0.8)
+text(x      = rep(1:n, each = n),
+     y      = rep(1:n, times = n),
+     labels = round(cm_ord[n:1, ], 2),
+     cex    = 0.65)
+box()
+legend("right", inset = -0.18,
+       legend = c("-1", "0", "1"),
+       fill   = c("navy", "white", "maroon"),
+       title  = "cor")
+```
+\FloatBarrier
+Figure \ref{fig:corrmatrix} shows the strongest correlations with `medv` are `lstat` ($-0.730$), `rm` ($0.727$), 
+`ptratio` ($-0.581$), `indus` ($-0.488$), and `tax` ($-0.484$). Strong 
+correlation among predictors — particularly `rad` and `tax` — suggests 
+potential multicollinearity in a plain linear model. The exploratory phase 
+identifies `lstat`, `rm`, `ptratio`, `tax`, `indus`, `nox`, and `crim` as 
+the most promising predictors.
+
+## Model Building
+
+After setting aside approximately 20% of the data for testing, the saturated 
+model was fitted to the training data.
+
+```{r modelling-coefficients}
+library(broom)
+library(kableExtra)
+
+lm_all <- lm(medv ~ ., data = boston_data)
+
+lm_all |>
+  tidy() |>
+  kable(
+    digits   = 4,
+    caption  = "\\label{tab:fullreg}Coefficient estimates, standard errors, t-statistics, and p-values for the full linear regression model",
+    label    = "fullreg",
+    booktabs = TRUE
+  ) |>
+  kable_styling(
+    full_width    = FALSE,
+    latex_options = c("striped", "hold_position")
+  )
+```
+
+### Parameter Significance
+
+From Table \ref{tab:fullreg}, `indus` is the most statistically insignificant 
+predictor (p-value $= 0.79$) — holding all other predictors constant, the 
+proportion of non-retail business acres does very little to impact median sale 
+price. The next least significant predictor is `age` (p-value $= 0.50$), 
+indicating that the age of housing stock adds negligible explanatory power 
+once other variables are accounted for. Both will be candidates for removal 
+during model improvement.
+
+```{r modelling-fit}
+lm_summary <- summary(lm_all)
+
+model_stats <- data.frame(
+  Statistic = c("Residual standard error",
+                "Degrees of freedom",
+                "Multiple R-squared",
+                "Adjusted R-squared",
+                "F-statistic"),
+  Value = c(round(lm_summary$sigma, 3),
+            lm_summary$df[2],
+            round(lm_summary$r.squared, 4),
+            round(lm_summary$adj.r.squared, 4),
+            round(lm_summary$fstatistic[1], 3))
+)
+
+kable(model_stats,
+      caption  = "\\label{tab:modelfit}Overall fit statistics for the full linear regression model.",
+      booktabs = TRUE) |>
+  kable_styling(
+    full_width    = FALSE,
+    latex_options = c("striped", "hold_position")
+  )
+```
+
+The residual standard error of `r round(lm_summary$sigma, 3)` indicates that 
+on average, the model's predictions deviate from the true median home value 
+by approximately \$`r round(lm_summary$sigma * 1000)` on the training data, 
+with `r lm_summary$df[2]` degrees of freedom remaining after estimating all 
+model parameters. The R\textsuperscript{2} of 
+`r round(lm_summary$r.squared, 4)` means that approximately 
+`r round(lm_summary$r.squared * 100, 1)`\% of the variation in median home 
+values is explained by the model on the training data. The F-statistic of 
+`r round(lm_summary$fstatistic[1], 3)` tests the null hypothesis that none of 
+the predictors have any linear relationship with `medv`. The extremely small 
+associated p-value provides overwhelming evidence to reject this null 
+hypothesis, confirming that the model as a whole is statistically significant.
+
+### Testing Predictive Fit
+
+```{r testing, echo=FALSE}
+full_boston <- read.csv("boston.csv")
+
+set.seed(1494)
+train_ind  <- sample(1:nrow(full_boston), 400, replace = FALSE)
+train_data <- full_boston[train_ind, ]
+test_data  <- full_boston[-train_ind, ]
+
+test_data$chas <- factor(test_data$chas,
+                         levels = c(0, 1),
+                         labels = c("No", "Yes"))
+
+y_test    <- test_data$medv
+yhat_test <- predict(lm_all, newdata = test_data)
+
+test_mse  <- mean((y_test - yhat_test)^2)
+test_rmse <- sqrt(test_mse)
+test_r2   <- 1 - sum((y_test - yhat_test)^2) /
+                 sum((y_test - mean(y_test))^2)
+
+test_stats <- data.frame(
+  Statistic = c("Test MSE", "Test RMSE", "Test R-squared"),
+  Value     = c(test_mse, test_rmse, test_r2)
+)
+
+kable(test_stats,
+      digits    = 4,
+      caption   = "\\label{tab:testfit}Test-set performance of the full linear regression model on the held-out Boston suburbs.",
+      booktabs  = TRUE,
+      col.names = c("Test Statistic", "Value")) |>
+  kable_styling(
+    full_width    = FALSE,
+    latex_options = c("striped")
+  )
+```
+
+The full model explains `r round(test_r2 * 100, 1)`\% of the variation in 
+median home values on unseen suburbs (Test R\textsuperscript{2} $=$ 
+`r round(test_r2, 4)`), meaning roughly 
+`r round((1 - test_r2) * 100, 1)`\% of variation remains unexplained. The 
+Test RMSE of `r round(test_rmse, 3)` means that on average, the model's 
+predictions are off by approximately \$`r round(test_rmse * 1000)` from the 
+true value. The Test MSE of `r round(test_mse, 3)` is the average squared 
+prediction error — because errors are squared, larger individual mistakes are 
+penalised disproportionately, making the MSE sensitive to the extreme home 
+values observed in the right-skewed `medv` distribution. This value serves 
+as the baseline benchmark for all subsequent models.
+
+## Model Improvement
+
+To improve the full model, backward stepwise selection was applied using both 
+AIC and BIC as stopping criteria. Predictors are removed iteratively starting 
+from the least significant, stopping when further removal increases the 
+information criterion.
+
+```{r model-improvement}
+library(dplyr)
+library(broom)
+library(kableExtra)
+
+full_model   <- lm(medv ~ ., data = boston_data)
+n            <- nrow(boston_data)
+backward_AIC <- step(full_model, direction = "backward", trace = 0)
+backward_BIC <- step(full_model, direction = "backward", k = log(n), trace = 0)
+
+model_kable <- function(model, cap, lab) {
+  model |>
+    tidy() |>
+    mutate(significant = ifelse(p.value < 0.05, "Yes", "No")) |>
+    kable(
+      digits    = 4,
+      caption   = cap,
+      booktabs  = TRUE,
+      col.names = c("Predictor", "Estimate", "Std. Error",
+                    "t-value", "p-value", "Significant")
+    ) |>
+    kable_styling(
+      full_width    = FALSE,
+      latex_options = c("striped")
+    )
+}
+```
+```{r full-model-coefficients, echo=FALSE}
+model_kable(
+  full_model,
+  "\\label{tab:fullcoef}Coefficient estimates for the full model.",
+  "fullcoef"
+)
+```
+
+```{r backward-aic-coefficients}
+model_kable(
+  backward_AIC,
+  "\\label{tab:aiccoef}Coefficient estimates for the Backward AIC model",
+  "aiccoef"
+)
+```
+
+```{r backward-bic-coefficients}
+model_kable(
+  backward_BIC,
+  "\\label{tab:biccoef}Coefficient estimates for the Backward BIC model. Both AIC and BIC criteria converged on the same reduced model.",
+  "biccoef"
+)
+```
+
+Both the AIC and BIC backward stepwise procedures removed `indus` and `age`, 
+converging on the same 10-predictor model. This agreement between two 
+independent criteria strengthens confidence in the variable selection outcome.
+
+### Variable Selection
+
+```{r AIC-BIC-selection}
+library(caret)
+
+set.seed(1494)
+ctrl <- trainControl(method = "cv", number = 10)
+
+cv_full <- train(formula(full_model),   data = boston_data,
+                 method = "lm", trControl = ctrl)
+cv_AIC  <- train(formula(backward_AIC), data = boston_data,
+                 method = "lm", trControl = ctrl)
+cv_BIC  <- train(formula(backward_BIC), data = boston_data,
+                 method = "lm", trControl = ctrl)
+
+comparison <- data.frame(
+  Model       = c("Full", "Backward AIC", "Backward BIC"),
+  Predictors  = c(length(coef(full_model))   - 1,
+                  length(coef(backward_AIC)) - 1,
+                  length(coef(backward_BIC)) - 1),
+  AIC         = round(AIC(full_model, backward_AIC, backward_BIC)$AIC, 2),
+  BIC         = round(BIC(full_model, backward_AIC, backward_BIC)$BIC, 2),
+  CV_RMSE     = round(c(cv_full$results$RMSE,
+                        cv_AIC$results$RMSE,
+                        cv_BIC$results$RMSE), 4),
+  CV_Rsquared = round(c(cv_full$results$Rsquared,
+                        cv_AIC$results$Rsquared,
+                        cv_BIC$results$Rsquared), 4)
+)
+
+comparison |>
+  kable(
+    caption  = "Comparison of full and backward stepwise models by number of predictors, AIC, BIC, 10-fold CV RMSE, and CV R-squared. The best model by CV RMSE is highlighted.",
+    label    = "modelcomp",
+    booktabs = TRUE
+  ) |>
+  kable_styling(
+    full_width    = FALSE,
+    latex_options = c("striped", "hold_position")
+  ) |>
+  row_spec(which.min(comparison$CV_RMSE),
+           bold       = TRUE,
+           color      = "white",
+           background = "green")
+```
+
+From Table \ref{tab:modelcomp}, the Backward AIC model achieves the lowest 
+CV RMSE of `r round(cv_AIC$results$RMSE, 4)` against the full model's 
+`r round(cv_full$results$RMSE, 4)`, making it the preferred model among the 
+three. The identical AIC and BIC values for the two backward models confirm 
+they selected the same predictors.
+
+### Regularisation
+
+```{r regularization, fig.cap="\\label{fig:regular}10-fold cross-validation MSE curves for Ridge (left) and LASSO (right) regularisation", fig.width=7, fig.height=4}
+library(glmnet)
+library(ggplot2)
+library(gridExtra)
+
+boston_matrix      <- boston_data
+boston_matrix$chas <- as.numeric(boston_matrix$chas == "Yes")
+
+X_mat <- model.matrix(medv ~ ., data = boston_matrix)[, -1]
+Y_vec <- boston_matrix$medv
+
+set.seed(1494)
+cv_ridge  <- cv.glmnet(X_mat, Y_vec, alpha = 0, nfolds = 10)
+ridge_mod <- glmnet(X_mat, Y_vec, alpha = 0, lambda = cv_ridge$lambda.min)
+
+cv_lasso  <- cv.glmnet(X_mat, Y_vec, alpha = 1, nfolds = 10)
+lasso_mod <- glmnet(X_mat, Y_vec, alpha = 1, lambda = cv_lasso$lambda.min)
+
+ridge_rmse <- sqrt(min(cv_ridge$cvm))
+lasso_rmse <- sqrt(min(cv_lasso$cvm))
+
+plot_cv_glmnet <- function(cv_fit, title) {
+  df <- data.frame(
+    log_lambda = log(cv_fit$lambda),
+    mse        = cv_fit$cvm,
+    upper      = cv_fit$cvup,
+    lower      = cv_fit$cvlo,
+    nzero      = cv_fit$nzero
+  )
+  lambda_min <- log(cv_fit$lambda.min)
+  lambda_1se <- log(cv_fit$lambda.1se)
+  n_df       <- nrow(df)
+  every_n    <- max(1, round(n_df / 15))
+  label_df   <- df[seq(1, n_df, by = every_n), ]
+
+  ggplot(df, aes(x = log_lambda, y = mse)) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.15) +
+    geom_line(color = "red") +
+    geom_point(color = "red", size = 1.5) +
+    geom_vline(xintercept = lambda_min, linetype = "dashed") +
+    geom_vline(xintercept = lambda_1se, linetype = "dashed") +
+    geom_text(data = label_df,
+              aes(x = log_lambda, y = max(df$upper), label = nzero),
+              size = 3, color = "black") +
+    scale_x_continuous(limits = c(0, max(log(cv_fit$lambda)))) +
+    labs(title = title,x= expression(log(lambda)), y = "Mean-Squared Error") +
+    theme_minimal()
+}
+
+p1 <- plot_cv_glmnet(cv_ridge, "Ridge")
+p2 <- plot_cv_glmnet(cv_lasso, "LASSO")
+grid.arrange(p1, p2, ncol = 2)
+```
+
+In Figure \ref{fig:regular} regularisation was applied to control model complexity and guard against 
+overfitting. Using `lambda.min` — the penalty value minimising 10-fold CV 
+error — Ridge achieved a CV RMSE of `r round(ridge_rmse, 4)` and LASSO 
+achieved `r round(lasso_rmse, 4)`. Ridge retains all 12 predictors throughout 
+the penalty path, shrinking coefficients toward zero without eliminating them. 
+LASSO progressively zeroes out weaker predictors as the penalty increases, 
+performing automatic variable selection.
+
+#### Goodness of Model Fit
+
+```{r prediction-and-MSE-calcs}
+final_comparison <- data.frame(
+  Model   = c("Full", "Backward AIC", "Backward BIC", "Ridge", "LASSO"),
+  CV_RMSE = round(c(cv_full$results$RMSE,
+                    cv_AIC$results$RMSE,
+                    cv_BIC$results$RMSE,
+                    ridge_rmse,
+                    lasso_rmse), 4)
+)
+
+final_comparison |>
+  arrange(CV_RMSE) |>
+  kable(
+    caption  = "Final model comparison by 10-fold cross-validated RMSE across all candidate models. The best-performing model is highlighted.",
+    label    = "finalcomp",
+    booktabs = TRUE
+  ) |>
+  kable_styling(
+    full_width    = FALSE,
+    latex_options = c("striped", "hold_position")
+  ) |>
+  row_spec(1, bold = TRUE, color = "white", background = "green")
+```
+
+From Table \ref{tab:finalcomp}, the Backward AIC model is the best-performing 
+model with a CV RMSE of `r round(min(final_comparison$CV_RMSE), 4)`, 
+outperforming all alternatives including regularisation methods. Its CV RMSE 
+is `r round(final_comparison$CV_RMSE[final_comparison$Model == "Full"] - min(final_comparison$CV_RMSE), 4)` 
+lower than the full model, confirming that the removed predictors contributed 
+noise rather than signal.
+
+```{r interaction-term}
+base_final <- backward_AIC
+main_terms <- attr(terms(base_final), "term.labels")
+
+candidate_interactions <- combn(
+  main_terms, 2,
+  FUN      = function(x) paste(x, collapse = ":"),
+  simplify = TRUE
+)
+
+set.seed(1494)
+fold_id <- sample(rep(1:10, length.out = nrow(boston_data)))
+
+cv_rmse_fn <- function(model_formula) {
+  pred <- rep(NA_real_, nrow(boston_data))
+  for (k in 1:10) {
+    fit_k <- lm(model_formula, data = boston_data[fold_id != k, ])
+    pred[fold_id == k] <- predict(fit_k,
+                                  newdata = boston_data[fold_id == k, ])
+  }
+  sqrt(mean((boston_data$medv - pred)^2))
+}
+
+score_interaction <- function(interaction_term) {
+  f   <- update(formula(base_final), paste(". ~ . +", interaction_term))
+  fit <- lm(f, data = boston_data)
+  data.frame(
+    Interaction   = interaction_term,
+    AIC           = AIC(fit),
+    BIC           = BIC(fit),
+    Adj_R2        = summary(fit)$adj.r.squared,
+    CV_RMSE       = cv_rmse_fn(f),
+    Test_RMSE     = sqrt(mean((test_data$medv -
+                               predict(fit, newdata = test_data))^2)),
+    Interaction_p = drop1(fit, test = "F")[interaction_term, "Pr(>F)"]
+  )
+}
+
+base_row <- data.frame(
+  Interaction   = "None",
+  AIC           = AIC(base_final),
+  BIC           = BIC(base_final),
+  Adj_R2        = summary(base_final)$adj.r.squared,
+  CV_RMSE       = cv_rmse_fn(formula(base_final)),
+  Test_RMSE     = sqrt(mean((test_data$medv -
+                             predict(base_final,
+                                     newdata = test_data))^2)),
+  Interaction_p = NA
+)
+
+interaction_results <- do.call(rbind,
+                               lapply(candidate_interactions,
+                                      score_interaction))
+interaction_results <- rbind(base_row, interaction_results)
+interaction_results <- interaction_results[
+  order(interaction_results$CV_RMSE), ]
+
+best_interaction        <- interaction_results$Interaction[1]
+final_interaction_model <- lm(
+  update(formula(base_final), paste(". ~ . +", best_interaction)),
+  data = boston_data
+)
+```
+
+The selected interaction term is `r best_interaction`. `rm` measures the 
+average number of rooms per dwelling, while `lstat` measures the percentage 
+of lower-status residents. The negative `rm:lstat` coefficient indicates that 
+the price premium associated with having more rooms is not constant: extra 
+rooms add more value in lower-`lstat` suburbs than in higher-`lstat` ones, 
+reflecting that spacious homes in affluent areas command a disproportionately 
+higher price.
+
+## Residual Diagnostics
+
+```{r residual-diagnostics, fig.cap="Standard residual diagnostic plots for the final interaction model: (top-left) residuals vs fitted values", fig.width=6, fig.height=7}
+
+final_residuals <- residuals(final_interaction_model)
+final_fitted    <- fitted(final_interaction_model)
+final_std_res   <- rstandard(final_interaction_model)
+
+RSS <- sum(final_residuals^2)
+RSE <- sqrt(RSS / df.residual(final_interaction_model))
+
+par(mfrow = c(2, 2))
+plot(final_interaction_model, which = 1) # Residuals vs fitted
+plot(final_interaction_model, which = 2) # Normal Q-Q
+plot(final_interaction_model, which = 3) # Scale-location
+plot(final_interaction_model, which = 5) # Residuals vs leverage
+par(mfrow = c(1, 1))
+```
+
+
+```{r diagnostic-summary}
+diagnostic_summary <- data.frame(
+  Diagnostic = c(
+    "Mean residual",
+    "Residual standard deviation",
+    "Largest absolute standardised residual",
+    "Observations with |standardised residual| > 2"
+  ),
+  Value = c(
+    round(mean(final_residuals), 3),
+    round(sd(final_residuals), 3),
+    round(max(abs(final_std_res)), 4),
+    sum(abs(final_std_res) > 2)
+  )
+)
+
+diagnostic_summary |>
+  kable(
+    caption  = "Numerical residual diagnostic summary for the final interaction model.",
+    label    = "diagsum",
+    booktabs = TRUE
+  ) |>
+  kable_styling(
+    full_width    = FALSE,
+    latex_options = c("striped", "hold_position")
+  ) |>
+  column_spec(2, width = "3cm")
+```
+
+## Conclusion
+This analysis set out to predict median home values across Boston suburbs and to 
+identify which suburb characteristics most strongly influence housing prices.
+Across all modelling approaches evaluated, the Backward AIC model 
+with an `r best_interaction` interaction term emerged as the best-performing 
+model, achieving the lowest cross-validated RMSE of 
+`r round(min(final_comparison$CV_RMSE), 4)`.
+The retained predictors in the final model point to three broad categories of 
+influence on median home values:
+
+**Socioeconomic status** is the strongest driver. `lstat`, the percentage of 
+lower-status residents, has the largest negative relationship with `medv`as
+suburbs with higher lower-status residents have lower median home values. 
+
+**Property characteristics** also matter substantially. `rm`, the average 
+number of rooms per dwelling, has the strongest positive relationship with 
+`medv`. `ptratio`, the pupil-teacher ratio,has a negative effect, suggesting that access to better-resourced schools impacts home prices.
+
+**Environmental and structural factors** such as nitrogen oxide concentration 
+(`nox`), highway accessibility (`rad`), property tax rate (`tax`), and crime 
+rate (`crim`) all contribute negatively to home values with these houses seeing lower median prices. 
+Distance to employment centres (`dis`) has a positive effect, suggesting 
+suburbs further from industrial areas are valued more highly.
+
+Notably, `indus` and `age` were dropped by both backward selection criteria, 
+confirming that the proportion of non-retail business acres and housing age 
+add no meaningful predictive signal once the other variables are accounted for.
+The final model performs reasonably well, explaining approximately 
+`r round(test_r2 * 100, 1)`\% of variation in median home values on unseen 
+suburbs.
